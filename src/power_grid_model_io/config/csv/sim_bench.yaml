@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2022 Contributors to the Power Grid Model project <dynamic.grid.calculation@alliander.com>
+#
+# SPDX-License-Identifier: MPL-2.0
+---
+grid:
+  Node:
+    node:
+      id: id
+  Line:
+    line:
+      id: id
+      from_node: nodeA
+      to_node: nodeB

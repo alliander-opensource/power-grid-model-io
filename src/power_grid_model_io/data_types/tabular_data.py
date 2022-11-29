@@ -6,7 +6,7 @@ The TabularData class is a wrapper around Dict[str, Union[pd.DataFrame, np.ndarr
 which supports unit conversions and value substitutions
 """
 
-from typing import Dict, Iterable, Optional, Tuple, Union
+from typing import Callable, Dict, Generator, Iterable, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -15,6 +15,8 @@ import structlog
 from power_grid_model_io.mappings.unit_mapping import UnitMapping
 from power_grid_model_io.mappings.value_mapping import ValueMapping
 
+LazyDataFrame = Callable[[], pd.DataFrame]
+
 
 class TabularData:
     """
@@ -22,7 +24,7 @@ class TabularData:
     which supports unit conversions and value substitutions
     """
 
-    def __init__(self, **tables: Union[pd.DataFrame, np.ndarray]):
+    def __init__(self, **tables: Union[pd.DataFrame, LazyDataFrame, np.ndarray]):
         """
         Tabular data can either be a collection of pandas DataFrames and/or numpy structured arrays.
         The key word arguments will define the keys of the data.
@@ -34,12 +36,12 @@ class TabularData:
             **tables: A collection of pandas DataFrames and/or numpy structured arrays
         """
         for table_name, table_data in tables.items():
-            if not isinstance(table_data, (pd.DataFrame, np.ndarray)):
+            if not isinstance(table_data, (pd.DataFrame, np.ndarray)) and not callable(table_data):
                 raise TypeError(
                     f"Invalid data type for table '{table_name}'; "
                     f"expected a pandas DataFrame or NumPy array, got {type(table_data).__name__}."
                 )
-        self._data: Dict[str, Union[pd.DataFrame, np.ndarray]] = tables
+        self._data: Dict[str, Union[pd.DataFrame, LazyDataFrame, np.ndarray]] = tables
         self._units: Optional[UnitMapping] = None
         self._substitution: Optional[ValueMapping] = None
         self._log = structlog.get_logger(type(self).__name__)
@@ -73,7 +75,7 @@ class TabularData:
         Returns:
             The required column, with unit conversions and value substitutions applied
         """
-        table_data = self._data[table_name]
+        table_data = self[table_name]
 
         # If the index 'column' is requested, but no column called 'index' exist,
         # return the index of the dataframe as if it were an actual column.
@@ -171,6 +173,8 @@ class TabularData:
 
         Returns: The 'raw' table data
         """
+        if callable(self._data[table_name]):
+            self._data[table_name] = self._data[table_name]()
         return self._data[table_name]
 
     def keys(self) -> Iterable[str]:
@@ -182,13 +186,11 @@ class TabularData:
 
         return self._data.keys()
 
-    def items(self) -> Iterable[Tuple[str, Union[pd.DataFrame, np.ndarray]]]:
+    def items(self) -> Generator[Tuple[str, Union[pd.DataFrame, np.ndarray]], None, None]:
         """
         Mimic the dictionary .items() function
 
         Returns: An iterator over the table names and the raw table data
         """
-
-        # Note: PyCharm complains about the type, but it is correct, as an ItemsView extends from
-        # AbstractSet[Tuple[_KT_co, _VT_co]], which actually is compatible with Iterable[_KT_co, _VT_co]
-        return self._data.items()
+        for key in self._data:
+            yield key, self[key]

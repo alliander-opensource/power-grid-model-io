@@ -234,7 +234,10 @@ class PgmJsonConverter(BaseConverter[StructuredData]):
         return {
             component: [
                 {attribute: obj[attribute].tolist() for attribute in objects.dtype.names if not is_nan(obj[attribute])}
-                | extra_info.get(obj["id"], {})
+                | {
+                    (attr if attr not in objects.dtype.names else attr + "_"): val
+                    for attr, val in extra_info.get(obj["id"], {}).items()
+                }
                 for obj in objects
             ]
             for component, objects in data.items()

@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: 2022 Contributors to the Power Grid Model IO project <dynamic.grid.calculation@alliander.com>
 #
 # SPDX-License-Identifier: MPL-2.0
+
 import pytest
-from pytest import fixture
+from pytest import fixture, raises
 
 from power_grid_model_io.mappings.tabular_mapping import TabularMapping
 
