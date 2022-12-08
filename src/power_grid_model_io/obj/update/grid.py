@@ -5,13 +5,14 @@
 from typing import Optional
 
 from power_grid_model.data_types import BatchDataset
+
 from power_grid_model_io.obj.grid import BatchGrid
 from power_grid_model_io.obj.update.line import UpdateLineArray
 
 
 class UpdateGrid(BatchGrid):
-    line: UpdateLineArray
+    lines: UpdateLineArray
 
     def __init__(self, data: Optional[BatchDataset] = None):
-        self.line = UpdateLineArray()
+        self.lines = UpdateLineArray()
         super().__init__(data=data)
