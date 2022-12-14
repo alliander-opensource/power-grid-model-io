@@ -4,9 +4,10 @@
 """
 Panda Power Converter
 """
+import math
 import re
 from functools import lru_cache
-from typing import Dict, Mapping, Optional, Union
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,7 @@ CONNECTION_PATTERN_PP = re.compile(r"(Y|YN|D|Z|ZN)(y|yn|d|z|zn)\d*")
 CONNECTION_PATTERN_PP_3WDG = re.compile(r"(Y|YN|D|Z|ZN)(y|yn|d|z|zn)(y|yn|d|z|zn)\d*")
 
 
+# pylint: disable=too-many-instance-attributes
 class PandaPowerConverter(BaseConverter[PandaPowerData]):
     """
     Panda Power Converter
@@ -37,6 +39,9 @@ class PandaPowerConverter(BaseConverter[PandaPowerData]):
         self.system_frequency: float = system_frequency
         self.pp_data: PandaPowerData = {}
         self.pgm_data: Dataset = {}
+        self.pp_output_data: PandaPowerData = {}
+        self.pgm_output_data: Dataset = {}
+        self.pgm_nodes_lookup: pd.DataFrame = pd.DataFrame()
         self.idx: Dict[str, pd.Series] = {}
         self.idx_lookup: Dict[str, pd.Series] = {}
         self.next_idx = 0
@@ -52,6 +57,7 @@ class PandaPowerConverter(BaseConverter[PandaPowerData]):
 
         # Set pandas data
         self.pp_data = data
+
         # Convert
         if data_type == "input":
             self._create_input_data()
@@ -61,13 +67,27 @@ class PandaPowerConverter(BaseConverter[PandaPowerData]):
         # Construct extra_info
         if extra_info is not None:
             for pp_table, indices in self.idx_lookup.items():
-                for pgm_idx, pp_idx in zip(indices.index, indices):
-                    extra_info[pgm_idx] = {"id_reference": {"table": pp_table, "index": pp_idx}}
+                for pgm_id, pp_idx in zip(indices.index, indices):
+                    extra_info[pgm_id] = {"id_reference": {"table": pp_table, "index": pp_idx}}
 
         return self.pgm_data
 
     def _serialize_data(self, data: Dataset, extra_info: Optional[ExtraInfoLookup]) -> PandaPowerData:
-        raise NotImplementedError()
+
+        # If extra_info is supplied idx_lookup should be created accordingly
+        if extra_info is not None:
+            self._extra_info_to_idx_lookup(extra_info)
+
+        # Clear pp data
+        self.pgm_nodes_lookup = pd.DataFrame()
+        self.pp_output_data = {}
+
+        self.pgm_output_data = data
+
+        # Convert
+        self._create_output_data()
+
+        return self.pp_output_data
 
     def _create_input_data(self):
         self._create_pgm_input_nodes()
@@ -79,6 +99,43 @@ class PandaPowerConverter(BaseConverter[PandaPowerData]):
         self._create_pgm_input_sym_gens()
         self._create_pgm_input_three_winding_transformers()
         self._create_pgm_input_links()
+
+    def _extra_info_to_idx_lookup(self, extra_info: ExtraInfoLookup):
+        self.idx = {}
+        self.idx_lookup = {}
+        pgm_to_pp_id: Dict[str, List[Tuple[int, int]]] = {}
+        for pgm_idx, extra in extra_info.items():
+            if "id_reference" not in extra:
+                continue
+            assert isinstance(extra["id_reference"], dict)
+            pp_table = extra["id_reference"]["table"]
+            pp_index = extra["id_reference"]["index"]
+            if pp_table not in pgm_to_pp_id:
+                pgm_to_pp_id[pp_table] = []
+            pgm_to_pp_id[pp_table].append((pgm_idx, pp_index))
+        for pp_table, table_pgm_to_pp_id in pgm_to_pp_id.items():
+            pgm_ids, pp_indices = zip(*table_pgm_to_pp_id)
+            self.idx[pp_table] = pd.Series(pgm_ids, index=pp_indices)
+            self.idx_lookup[pp_table] = pd.Series(pp_indices, index=pgm_ids)
+
+    def _create_output_data(self):
+
+        # Many pp components store the voltage magnitude per unit and the voltage angle in degrees,
+        # so let's create a global lookup table (indexed on the pgm ids)
+        self.pgm_nodes_lookup = pd.DataFrame(
+            [self.pgm_output_data["node"]["u_pu"], self.pgm_output_data["node"]["u_angle"] * 180.0 / math.pi],
+            columns=["vm_pu", "u_degree"],
+            index=self.pgm_output_data["node"]["id"],
+        )
+
+        self._pp_buses_output()
+        self._pp_lines_output()
+        self._pp_ext_grids_output()
+        self._pp_loads_output()
+        self._pp_shunts_output()
+        self._pp_trafos_output()
+        self._pp_sgens_output()
+        self._pp_trafos3w_output()
 
     def _create_pgm_input_nodes(self):
         assert "node" not in self.pgm_data
@@ -305,6 +362,301 @@ class PandaPowerConverter(BaseConverter[PandaPowerData]):
 
         self.pgm_data["link"] = pgm_links
 
+    def _pp_buses_output(self):
+        assert "bus" not in self.pp_output_data
+
+        pgm_nodes = self.pgm_output_data["node"]
+
+        pp_output_buses = pd.DataFrame(
+            columns=["vm_pu", "va_degree", "p_mw", "q_mvar"],
+            index=self._get_pp_ids("bus", pgm_nodes["id"]),
+        )
+
+        pp_output_buses["vm_pu"] = self.pgm_nodes_lookup["u_pu"]  # u_pu
+        pp_output_buses["va_degree"] = self.pgm_nodes_lookup["u_degree"]  # u_angle * 180 / pi
+
+        # p_to, p_from, q_to and q_from connected to the bus have to be summed up
+        self._pp_buses_output__accumulate_power(pp_output_buses)
+
+        self.pp_output_data["bus"] = pp_output_buses
+
+    def _pp_buses_output__accumulate_power(self, pp_output_buses: pd.DataFrame):
+        """
+        For each node, we need to accumulate the power for all connected branches and branch3s
+        """
+
+        # Let's define all the components and sides where nodes can be connected
+        component_sides = {
+            "line": [("from_node", "p_from", "q_from"), ("to_node", "p_to", "q_to")],
+            "link": [("from_node", "p_from", "q_from"), ("to_node", "p_to", "q_to")],
+            "transformer": [("from_node", "p_from", "q_from"), ("to_node", "p_to", "q_to")],
+            "three_winding_transformer": [("node_1", "p_1", "q_1"), ("node_2", "p_2", "q_2"), ("node_3", "p_3", "q_3")],
+        }
+
+        # Set the initial powers to zero
+        pp_output_buses["p_mw"] = 0.0
+        pp_output_buses["q_mvar"] = 0.0
+
+        # Now loop over all components, skipping the components that don't exist or don't contain data
+        for component, sides in component_sides.items():
+            if component not in self.pgm_output_data or self.pgm_output_data[component].size == 0:
+                continue
+
+            if component not in self.pgm_data:
+                raise KeyError(f"PGM input_data is needed to accumulate output for {component}s.")
+
+            for node_col, p_col, q_col in sides:
+                # Select the columns that we are going to use
+                component_data = pd.DataFrame(
+                    zip(
+                        self.pgm_data[component][node_col],
+                        self.pgm_output_data[component][p_col],
+                        self.pgm_output_data[component][q_col],
+                    ),
+                    columns=[node_col, p_col, q_col],
+                )
+
+                # Accumulate the powers and index by panda power bus index
+                accumulated_data = component_data.groupby(node_col).sum()
+                accumulated_data.index = self._get_pp_ids("bus", pd.Series(accumulated_data.index))
+
+                # We might not have power data for each pp bus, so select only the indexes for which data is available
+                idx = pp_output_buses.index.intersection(accumulated_data.index)
+
+                # Now add the active and reactive powers to the pp busses
+                # Note that the units are incorrect; for efficiency, unit conversions will be applied at the end.
+                pp_output_buses.loc[idx, "p_mw"] += accumulated_data[p_col]
+                pp_output_buses.loc[idx, "q_mvar"] += accumulated_data[q_col]
+
+        # Finally apply the unit conversion (W -> MW and VAR -> MVAR)
+        pp_output_buses["p_mw"] /= 1e6
+        pp_output_buses["q_mvar"] /= 1e6
+
+    def _pp_lines_output(self):
+        assert "line" not in self.pp_output_data
+        assert "line" in self.pgm_data
+
+        pgm_input_lines = self.pgm_data["line"]
+        pgm_output_lines = self.pgm_output_data["line"]
+
+        pp_output_lines = pd.DataFrame(
+            columns=[
+                "p_from_mw",
+                "q_from_mvar",
+                "p_to_mw",
+                "q_to_mvar",
+                "pl_mw",
+                "ql_mvar",
+                "i_from_ka",
+                "i_to_ka",
+                "i_ka",
+                "vm_from_pu",
+                "vm_to_pu",
+                "va_from_degree",
+                "va_to_degree",
+                "loading_percent",
+            ],
+            index=self._get_pp_ids("line", pgm_output_lines["id"]),
+        )
+
+        from_nodes = self.pgm_nodes_lookup[pgm_input_lines["from_node"]]
+        to_nodes = self.pgm_nodes_lookup[pgm_input_lines["to_node"]]
+
+        pp_output_lines["p_from_mw"] = pgm_output_lines["p_from"] * 1e-6  # p_from * 1e6
+        pp_output_lines["q_from_mvar"] = pgm_output_lines["q_from"] * 1e-6  # q_from
+        pp_output_lines["p_to_mw"] = pgm_output_lines["p_to"] * 1e-6  # p_to
+        pp_output_lines["q_to_mvar"] = pgm_output_lines["q_to"] * 1e-6  # q_to
+        pp_output_lines["pl_mw"] = (pgm_output_lines["p_from"] + pgm_output_lines["p_to"]) * 1e-6  # p_from + p_to
+        pp_output_lines["ql_mvar"] = (pgm_output_lines["q_from"] + pgm_output_lines["q_to"]) * 1e-6  # q_from + q_to
+        pp_output_lines["i_from_ka"] = pgm_output_lines["i_from"] * 1e-3  # i_from
+        pp_output_lines["i_to_ka"] = pgm_output_lines["i_to"] * 1e-3  # i_to
+        pp_output_lines["i_ka"] = pgm_output_lines[["i_from", "i_to"]].max(axis=1) * 1e-3  # max(i_from, i_to)
+        pp_output_lines["vm_from_pu"] = from_nodes["u_pu"]  # u_pu of the bus that is at from_node
+        pp_output_lines["vm_to_pu"] = to_nodes["u_pu"]  # u_pu of the bus that is at to_node
+        pp_output_lines["va_from_degree"] = from_nodes["u_angle_deg"]  # u_angle * 180 / pi at the from_bus
+        pp_output_lines["va_to_degree"] = to_nodes["u_angle_deg"]  # u_angle * 180 / pi at the to_bus
+        pp_output_lines["loading_percent"] = pgm_output_lines["loading"] * 1e2  # loading * 100
+
+        self.pp_output_data["line"] = pp_output_lines
+
+    def _pp_ext_grids_output(self):
+        assert "ext_grid" not in self.pp_output_data
+        assert "source" in self.pgm_data
+
+        pgm_output_sources = self.pgm_output_data["source"]
+
+        pp_output_ext_grids = pd.DataFrame(
+            columns=["p_mw", "q_mvar"], index=self._get_pp_ids("source", pgm_output_sources["id"])
+        )
+        pp_output_ext_grids["p_mw"] = pgm_output_sources["p"] * 1e-6
+        pp_output_ext_grids["q_mvar"] = pgm_output_sources["q"] * 1e-6
+
+        self.pp_output_data["ext_grid"] = pp_output_ext_grids
+
+    def _pp_shunts_output(self):
+        assert "shunt" not in self.pp_output_data
+        assert "shunt" in self.pgm_data
+
+        pgm_input_shunts = self.pgm_data["shunt"]
+
+        pgm_output_shunts = self.pgm_output_data["shunt"]
+
+        at_nodes = self.pgm_nodes_lookup[pgm_input_shunts["node"]]
+
+        pp_output_shunts = pd.DataFrame(
+            columns=["p_mw", "q_mvar", "vm_pu"], index=self._get_pp_ids("shunt", pgm_output_shunts["id"])
+        )
+        pp_output_shunts["p_mw"] = pgm_output_shunts["p"] * 1e-6  # p
+        pp_output_shunts["q_mvar"] = pgm_output_shunts["q"] * 1e-6  # q
+        pp_output_shunts["vm_pu"] = at_nodes["u_pu"]  # u_pu at the bus at node
+
+        self.pp_output_data["shunt"] = pp_output_shunts
+
+    def _pp_sgens_output(self):
+        assert "sgen" not in self.pp_output_data
+        assert "sym_gen" in self.pgm_data
+
+        pgm_input_sym_gens = self.pgm_data["sym_gen"]
+
+        pgm_output_sym_gens = self.pgm_output_data["sym_gen"]
+
+        at_nodes = self.pgm_nodes_lookup[pgm_input_sym_gens["node"]]
+
+        pp_output_sgens = pd.DataFrame(
+            columns=["p_mw", "q_mvar", "vm_pu"], index=self._get_pp_ids("sym_gen", pgm_output_sym_gens["id"])
+        )
+        pp_output_sgens["p_mw"] = pgm_output_sym_gens["p"] * 1e6  # p
+        pp_output_sgens["q_mvar"] = pgm_output_sym_gens["q"] * 1e6  # q
+        pp_output_sgens["vm_pu"] = at_nodes["u_pu"]  # u_pu at the bus at node
+
+        self.pp_output_data["sgen"] = pp_output_sgens
+
+    def _pp_trafos_output(self):
+        assert "trafo" not in self.pp_output_data
+        assert "transformer" in self.pgm_data
+
+        pgm_input_transformers = self.pgm_data["transformer"]
+
+        pgm_output_transformers = self.pgm_output_data["transformer"]
+
+        from_nodes = self.pgm_nodes_lookup[pgm_input_transformers["from_node"]]
+        to_nodes = self.pgm_nodes_lookup[pgm_input_transformers["to_node"]]
+
+        pp_output_trafos = pd.DataFrame(
+            columns=[
+                "p_hv_mw",
+                "q_hv_mvar",
+                "p_lv_mw",
+                "q_lv_mvar",
+                "pl_mw",
+                "ql_mvar",
+                "i_hv_ka",
+                "i_lv_ka",
+                "vm_hv_pu",
+                "vm_lv_pu",
+                "va_hv_degree",
+                "va_lv_degree",
+                "loading_percent",
+            ],
+            index=self._get_pp_ids("transformer", pgm_output_transformers["id"]),
+        )
+        pp_output_trafos["p_hv_mw"] = pgm_output_transformers["p_from"] * 1e-6  # p_from
+        pp_output_trafos["q_hv_mvar"] = pgm_output_transformers["q_from"] * 1e-6  # q_from
+        pp_output_trafos["p_lv_mw"] = pgm_output_transformers["p_to"] * 1e-6  # p_to
+        pp_output_trafos["q_lv_mvar"] = pgm_output_transformers["q_to"] * 1e-6  # q_to
+        pp_output_trafos["pl_mw"] = (pgm_output_transformers["p_from"] + pgm_output_transformers["p_to"]) * 1e-6
+        # p_from + p_to
+        pp_output_trafos["ql_mvar"] = (pgm_output_transformers["q_from"] + pgm_output_transformers["q_to"]) * 1e-6
+        # q_from + q_to
+        pp_output_trafos["i_hv_ka"] = pgm_output_transformers["i_from"] * 1e-3  # i_from
+        pp_output_trafos["i_lv_ka"] = pgm_output_transformers["i_to"] * 1e-3  # i_to
+        pp_output_trafos["vm_hv_pu"] = from_nodes["u_pu"]  # voltage at the bus at the from_node
+        pp_output_trafos["vm_lv_pu"] = to_nodes["u_pu"]  # voltage at the bus at the to_node
+        pp_output_trafos["va_hv_degree"] = from_nodes["u_angle"]  # u_angle at bus at the from_node
+        pp_output_trafos["va_lv_degree"] = to_nodes["u_angle"]  # u_angle at bus at the to_node
+        pp_output_trafos["loading_percent"] = pgm_output_transformers["loading"] * 1e2  # loading * 100
+
+        self.pp_output_data["trafo"] = pp_output_trafos
+
+    def _pp_trafos3w_output(self):
+        assert "trafo3w" not in self.pp_output_data
+        assert "three_winding_transformer" in self.pgm_data
+
+        pgm_input_transformers3w = self.pgm_data["three_winding_transformer"]
+
+        pgm_output_transformers3w = self.pgm_output_data["three_winding_transformer"]
+
+        nodes_1 = self.pgm_nodes_lookup[pgm_input_transformers3w["node_1"]]
+        nodes_2 = self.pgm_nodes_lookup[pgm_input_transformers3w["node_2"]]
+        nodes_3 = self.pgm_nodes_lookup[pgm_input_transformers3w["node_3"]]
+
+        pp_output_trafos3w = pd.DataFrame(
+            columns=[
+                "p_hv_mw",
+                "q_hv_mvar",
+                "p_mv_mw",
+                "q_mv_mvar",
+                "p_lv_mw",
+                "q_lv_mvar",
+                "pl_mw",
+                "ql_mvar",
+                "i_hv_ka",
+                "i_mv_ka",
+                "i_lv_ka",
+                "vm_hv_pu",
+                "vm_mv_pu",
+                "vm_lv_pu",
+                "va_hv_degree",
+                "va_mv_degree",
+                "va_lv_degree",
+                "loading_percent",
+            ],
+            index=self._get_pp_ids("three_winding_transformer", pgm_output_transformers3w["id"]),
+        )
+
+        pp_output_trafos3w["p_hv_mw"] = pgm_output_transformers3w["p_1"] * 1e-6  # p_1
+        pp_output_trafos3w["q_hv_mvar"] = pgm_output_transformers3w["q_1"] * 1e-6  # q_1
+        pp_output_trafos3w["p_mv_mw"] = pgm_output_transformers3w["p_2"] * 1e-6  # p_2
+        pp_output_trafos3w["q_mv_mvar"] = pgm_output_transformers3w["q_2"] * 1e-6  # q_2
+        pp_output_trafos3w["p_lv_mw"] = pgm_output_transformers3w["p_3"] * 1e-6  # p_3
+        pp_output_trafos3w["q_lv_mvar"] = pgm_output_transformers3w["q_e"] * 1e-6  # q_3
+        pp_output_trafos3w["pl_mw"] = (
+            pgm_output_transformers3w["p_1"] + pgm_output_transformers3w["p_2"] + pgm_output_transformers3w["p_3"]
+        ) * 1e-6  # p_1 + p_2 + p_3
+        pp_output_trafos3w["ql_mvar"] = (
+            pgm_output_transformers3w["p_1"] + pgm_output_transformers3w["p_2"] + pgm_output_transformers3w["p_3"]
+        ) * 1e-6  # q_1 + q_2 + q_3
+        pp_output_trafos3w["i_hv_ka"] = pgm_output_transformers3w["i_1"] * 1e-3  # i_1
+        pp_output_trafos3w["i_mv_ka"] = pgm_output_transformers3w["i_2"] * 1e-3  # i_2
+        pp_output_trafos3w["i_lv_ka"] = pgm_output_transformers3w["i_3"] * 1e-3  # i_3
+        pp_output_trafos3w["vm_hv_pu"] = nodes_1["u_pu"]  # voltage at the bus at the node_1
+        pp_output_trafos3w["vm_mv_pu"] = nodes_2["u_pu"]  # voltage at the bus at the node_2
+        pp_output_trafos3w["vm_lv_pu"] = nodes_3["u_pu"]  # voltage at the bus at the node_3
+        pp_output_trafos3w["va_hv_degree"] = nodes_1["u_angle"]  # u_angle at bus at the node_1
+        pp_output_trafos3w["va_mv_degree"] = nodes_2["u_angle"]  # u_angle at bus at the node_2
+        pp_output_trafos3w["va_lv_degree"] = nodes_3["u_angle"]  # u_angle at bus at the node_3
+        pp_output_trafos3w["loading_percent"] = pgm_output_transformers3w["loading"] * 1e2  # loading * 100
+
+        self.pp_output_data["trafo3w"] = pp_output_trafos3w
+
+    def _pp_loads_output(self):
+        pass
+        # assert "load" not in self.pp_output_data
+        # assert "sym_load" in self.pgm_data
+        #
+        # pgm_input_loads = self.pgm_data["sym_load"]
+        # # load_len =
+        #
+        # pp_output_loads = pd.DataFrame(columns=["p_mw", "q_mvar"])
+
+        # pp_output_loads["p_mw"] =
+
+        # total_loads = len()
+        # pgm_data["sym_load"]
+        # sym_load_p_id = self._get_pp_ids("sym_load_const_power", total_loads/3)
+        # sym_load_p = sym_load[]
+        # sym_load_z_id = self._get_pp_ids("sym_load_const_impedance", total_loads[])
+
     def _generate_ids(self, pp_table: str, pp_idx: pd.Index) -> np.arange:
         assert pp_table not in self.idx_lookup
         n_objects = len(pp_idx)
@@ -318,6 +670,11 @@ class PandaPowerConverter(BaseConverter[PandaPowerData]):
         if pp_table not in self.idx:
             raise KeyError(f"No indexes have been created for '{pp_table}'!")
         return self.idx[pp_table][pp_idx]
+
+    def _get_pp_ids(self, pp_table: str, pgm_idx: pd.Series) -> pd.Series:
+        if pp_table not in self.idx_lookup:
+            raise KeyError(f"No indexes have been created for '{pp_table}'!")
+        return self.idx_lookup[pp_table][pgm_idx]
 
     @staticmethod
     def _get_tap_size(pp_trafo: pd.DataFrame) -> np.ndarray:
