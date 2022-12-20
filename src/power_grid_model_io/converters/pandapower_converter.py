@@ -82,6 +82,9 @@ class PandaPowerConverter(BaseConverter[PandaPowerData]):
         self._create_pgm_input_sym_gens()
         self._create_pgm_input_three_winding_transformers()
         self._create_pgm_input_links()
+        self._create_pgm_input_ward()
+        self._create_pgm_input_xward()
+        self._create_pgm_input_motor()
 
     def _create_pgm_input_nodes(self):
         assert "node" not in self.pgm_data
@@ -373,6 +376,33 @@ class PandaPowerConverter(BaseConverter[PandaPowerData]):
         pgm_links["to_status"] = self._get_pp_attr("switch_b2b", "closed")
 
         self.pgm_data["link"] = pgm_links
+
+    def _create_pgm_input_ward(self):
+        pp_wards = self.pp_data["ward"]
+
+        if pp_wards.empty:
+            return
+
+        if len(pp_wards.index) > 0:
+            raise NotImplementedError("Ward is not implemented yet!")
+
+    def _create_pgm_input_xward(self):
+        pp_xwards = self.pp_data["xward"]
+
+        if pp_xwards.empty:
+            return
+
+        if len(pp_xwards.index) > 0:
+            raise NotImplementedError("Extended Ward is not implemented yet!")
+
+    def _create_pgm_input_motor(self):
+        pp_motors = self.pp_data["motor"]
+
+        if pp_motors.empty:
+            return
+
+        if len(pp_motors.index) > 0:
+            raise NotImplementedError("Motor is not implemented yet!")
 
     def _generate_ids(self, pp_table: str, pp_idx: pd.Index, name: Optional[str] = None) -> np.arange:
         key = (pp_table, name)
