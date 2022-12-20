@@ -42,7 +42,7 @@ jobs:
       - name: Store built wheel file
         uses: actions/upload-artifact@v3
         with:
-          name: pgm-io
+          name: power-grid-model-io
           path: wheelhouse/
 
   sonar-cloud:
@@ -103,7 +103,7 @@ jobs:
       - name: Load built wheel file
         uses: actions/download-artifact@v3
         with:
-          name: pgm-io
+          name: power-grid-model-io
           path: wheelhouse/
 
       - name: Install built wheel file
@@ -134,7 +134,7 @@ jobs:
       - name: Load built wheel file
         uses: actions/download-artifact@v3
         with:
-          name: pgm-io
+          name: power-grid-model-io
           path: wheelhouse/
 
       - name: Install built wheel file
@@ -165,7 +165,7 @@ jobs:
       - name: Load built wheel file
         uses: actions/download-artifact@v3
         with:
-          name: pgm-io
+          name: power-grid-model-io
           path: wheelhouse/
 
       - name: Upload wheels
